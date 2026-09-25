@@ -1,0 +1,10 @@
+PGUSER=db_username
+PGPASSWORD=yourpassword
+
+# Dump method: table (default, one file per table, not point-in-time consistent across tables)
+#           or full (single pg_dump -Fd per database, one consistent snapshot, restored with pg_restore)
+#METHOD=table
+#METHOD=full
+
+# Parallel jobs for pg_dump/pg_restore, only used when METHOD=full
+#JOBS=1
