@@ -93,6 +93,9 @@ CLEAN_DUMP_DIRS=0
 # Get a display date for the current date and time
 TIMESTAMP=$(date +"%Y-%m-%d-%H.%M")
 
+# number of failed dumps, the script exits with an error at the end if any
+DUMP_ERRORS=0
+
 # show banner
 echo "-----------------------------------------------------------------------------------------"
 echo "rsnapshot-postgres.sh"
@@ -287,7 +290,16 @@ fi
 # dump roles / grants (global objects, not tied to a single database)
 if [ -z "$TEST_RUN" ]; then
 	echo "Dumping roles/grants to $BACKUP_DIR/postgres-grants-$PG_HOST.sql"
-	pg_dumpall -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" --globals-only > "$BACKUP_DIR/postgres-grants-$PG_HOST.sql"
+	grants_file="$BACKUP_DIR/postgres-grants-$PG_HOST.sql"
+	if ! pg_dumpall -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" --globals-only > "$grants_file" 2>/dev/null ;then
+		# a non-superuser cannot read pg_authid (role password hashes), --no-role-passwords reads pg_roles instead
+		echo "WARNING: pg_dumpall failed (is $PGUSER a superuser?), retrying with --no-role-passwords: role password hashes will NOT be in the backup."
+		if ! pg_dumpall -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" --globals-only --no-role-passwords > "$grants_file" ;then
+			rm -f "$grants_file"
+			DUMP_ERRORS=$((DUMP_ERRORS + 1))
+			echo "ERROR: could not dump roles/grants."
+		fi
+	fi
 else
 	echo "(TEST RUN) Skipping roles/grants dump"
 fi
@@ -482,22 +494,32 @@ for db in $databaselist; do
 			# --no-owner --no-privileges   keep the per-table dump free of role-specific ALTER/GRANT statements (roles/grants are handled separately, see postgres-grants-*.sql)
 			# --table='schema.table'   dump only the given relation (its owned sequence, if any, is included automatically)
 
-			PGDUMP_OPT="--clean --if-exists --no-owner --no-privileges --table=\"${schema}.${table}\""
+			# --table takes a psql-style pattern where unquoted names are folded to lower case (so "Account" would
+			# not match), therefore both identifiers are double-quoted, doubling any embedded double quote
+			table_pattern="\"${schema//\"/\"\"}\".\"${table//\"/\"\"}\""
+			PGDUMP_OPT=(--clean --if-exists --no-owner --no-privileges "--table=${table_pattern}")
 
 			if [ -z "$TEST_RUN" ]; then
 
-				# dump the table/view and add lines to the restore script
+				# dump the table/view and add lines to the restore script (only if the dump succeeded)
 
 				if [[ $COMPRESSION == "gz" ]] ;then
 					printf '.gz ... '
 					filedump="$BACKUP_DIR/$db/$db-$schema.$table.sql.gz"
 					restorefiledump=$(basename "$filedump")
 					if [ ! -f "$filedump" ] ;then
-						eval pg_dump -d \"$db\" $PGDUMP_OPT | gzip -9 > "$filedump"
+						pg_dump -d "$db" "${PGDUMP_OPT[@]}" | gzip -9 > "$filedump"
+						if [ "${PIPESTATUS[0]}" -ne 0 ] ;then
+							rm -f "$filedump"
+							DUMP_ERRORS=$((DUMP_ERRORS + 1))
+							printf 'FAILED. '
+						fi
 					fi
-					echo "
-					echo \"Running $restorefiledump ...\"
-					zcat $db/$restorefiledump | psql -X -q \$RESTOREDB" >>"$restore_file"
+					if [ -f "$filedump" ] ;then
+						echo "
+						echo \"Running $restorefiledump ...\"
+						zcat $db/$restorefiledump | psql -X -q \$RESTOREDB" >>"$restore_file"
+					fi
 				fi
 
 				if [[ $COMPRESSION == "bz2" ]] ;then
@@ -505,11 +527,18 @@ for db in $databaselist; do
 					filedump="$BACKUP_DIR/$db/$db-$schema.$table.sql.bz2"
 					restorefiledump=$(basename "$filedump")
 					if [ ! -f "$filedump" ] ;then
-						eval pg_dump -d \"$db\" $PGDUMP_OPT | bzip2 -cq9 > "$filedump"
+						pg_dump -d "$db" "${PGDUMP_OPT[@]}" | bzip2 -cq9 > "$filedump"
+						if [ "${PIPESTATUS[0]}" -ne 0 ] ;then
+							rm -f "$filedump"
+							DUMP_ERRORS=$((DUMP_ERRORS + 1))
+							printf 'FAILED. '
+						fi
 					fi
-					echo "
-					echo \"Running $restorefiledump ...\"
-					bunzip2 < $db/$restorefiledump | psql -X -q \$RESTOREDB" >>"$restore_file"
+					if [ -f "$filedump" ] ;then
+						echo "
+						echo \"Running $restorefiledump ...\"
+						bunzip2 < $db/$restorefiledump | psql -X -q \$RESTOREDB" >>"$restore_file"
+					fi
 				fi
 
 				if [[ $COMPRESSION == "none" ]] ;then
@@ -517,11 +546,17 @@ for db in $databaselist; do
 					filedump="$BACKUP_DIR/$db/$db-$schema.$table.sql"
 					restorefiledump=$(basename "$filedump")
 					if [ ! -f "$filedump" ] ;then
-						eval pg_dump -d \"$db\" $PGDUMP_OPT > "$filedump"
+						if ! pg_dump -d "$db" "${PGDUMP_OPT[@]}" > "$filedump" ;then
+							rm -f "$filedump"
+							DUMP_ERRORS=$((DUMP_ERRORS + 1))
+							printf 'FAILED. '
+						fi
 					fi
-					echo "
-					echo \"Running $restorefiledump ...\"
-					cat $db/$restorefiledump | psql -X -q \$RESTOREDB" >>"$restore_file"
+					if [ -f "$filedump" ] ;then
+						echo "
+						echo \"Running $restorefiledump ...\"
+						cat $db/$restorefiledump | psql -X -q \$RESTOREDB" >>"$restore_file"
+					fi
 				fi
 
 			fi
@@ -553,12 +588,16 @@ for db in $databaselist; do
 		else
 			printf '            Dumping (pg_dump -Fd, consistent snapshot, %s job(s)) ... ' "$PGDUMP_JOBS"
 			rm -rf "$dumpdir"
-			pg_dump -d "$db" -Fd -j "$PGDUMP_JOBS" -Z "$ZLEVEL" --no-owner --no-privileges -f "$dumpdir"
-			printf 'done.\n'
-
-			echo "
-				echo \"Running pg_restore on $db/pgdump ...\"
-				pg_restore -j $PGDUMP_JOBS --no-owner --no-privileges --clean --if-exists -d \"\$RESTOREDB\" $db/pgdump" >>"$restore_file"
+			if pg_dump -d "$db" -Fd -j "$PGDUMP_JOBS" -Z "$ZLEVEL" --no-owner --no-privileges -f "$dumpdir" ;then
+				printf 'done.\n'
+				echo "
+					echo \"Running pg_restore on $db/pgdump ...\"
+					pg_restore -j $PGDUMP_JOBS --no-owner --no-privileges --clean --if-exists -d \"\$RESTOREDB\" $db/pgdump" >>"$restore_file"
+			else
+				rm -rf "$dumpdir"
+				DUMP_ERRORS=$((DUMP_ERRORS + 1))
+				printf 'FAILED.\n'
+			fi
 		fi
 
 	fi
@@ -589,5 +628,10 @@ done
 echo " "
 echo "Finished."
 echo "Remember that I also created some special files: postgres-grants*.sql, postgres-version*.txt and, for each database, the file: restore-*.sh"
+
+if [ "$DUMP_ERRORS" -gt 0 ] ;then
+	echo "ERROR: $DUMP_ERRORS dump(s) FAILED, this backup is INCOMPLETE. Check the errors above."
+	exit 1
+fi
 
 exit 0
